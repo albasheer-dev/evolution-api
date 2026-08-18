@@ -275,10 +275,9 @@ describe('ExampleService', () => {
 
 ### Application Fork Workflow
 
-- `app` is the permanent integration branch for the application fork.
-- Start every feature or fix branch from the latest `app` branch.
-- Open pull requests against `app`, not `main` or `develop`.
-- Do not commit product changes directly to `app`; merge them through pull requests.
+- `app` is the permanent working and release branch for the application fork.
+- Commit application changes directly to `app` without creating feature branches or pull requests.
+- Pull the latest `app` before making changes and push each completed commit back to `app`.
 - Create application release tags only from an up-to-date `app` commit.
 - Keep fork commit subjects short and natural, as a developer would write them, without decorative punctuation or generated summaries.
 
