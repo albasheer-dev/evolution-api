@@ -2,7 +2,10 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
-import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import {
+  ChatwootHistoryContact,
+  chatwootImport,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -2559,7 +2562,7 @@ export class ChatwootService {
     chatwootImport.addHistoryMessages(instance, messagesRaw);
   }
 
-  public addHistoryContacts(instance: InstanceDto, contactsRaw: ContactModel[]) {
+  public addHistoryContacts(instance: InstanceDto, contactsRaw: ChatwootHistoryContact[]) {
     if (!this.isImportHistoryAvailable()) {
       return;
     }

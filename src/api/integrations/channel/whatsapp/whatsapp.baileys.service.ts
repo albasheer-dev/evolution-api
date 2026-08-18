@@ -79,7 +79,7 @@ import { BadRequestException, InternalServerErrorException, NotFoundException } 
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
-import { Instance, Message } from '@prisma/client';
+import { Contact as ContactModel, Instance, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
@@ -154,6 +154,14 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import {
+  ContactIdentity,
+  contactIdentityKeys,
+  ExtendedBaileysContact,
+  mergeContactIdentity,
+  normalizeContactIdentities,
+  StoredContactIdentity,
+} from './contact-identity';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -225,6 +233,18 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+function normalizeListType(listMessage?: proto.Message.IListMessage | null): void {
+  if (listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST) {
+    listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+  }
+}
+
+type ContactWebhookPayload = ContactIdentity & {
+  instanceId: string;
+  displayName: string;
+  savedContactStatus: 'saved' | 'unknown';
+};
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -247,6 +267,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
+  private contactResyncPromise?: Promise<{
+    status: 'completed';
+    collection: 'critical_unblock_low';
+    forceFull: boolean;
+    requestedAt: string;
+  }>;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
@@ -676,19 +702,8 @@ export class BaileysStartupService extends ChannelStartupService {
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
       patchMessageBeforeSending(message) {
-        if (
-          message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
-        ) {
-          message = JSON.parse(JSON.stringify(message));
-
-          message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
-
-        if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
-          message = JSON.parse(JSON.stringify(message));
-
-          message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
+        normalizeListType(message.deviceSentMessage?.message?.listMessage);
+        normalizeListType(message.listMessage);
 
         return message;
       },
@@ -806,25 +821,154 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  private contactWebhookPayload(identity: ContactIdentity): ContactWebhookPayload {
+    return {
+      ...identity,
+      instanceId: this.instanceId,
+      displayName: identity.pushName,
+      savedContactStatus: identity.isMyContact === true ? 'saved' : 'unknown',
+    };
+  }
+
+  private storedContactIdentity(contact: ContactModel): StoredContactIdentity {
+    return {
+      remoteJid: contact.remoteJid,
+      canonicalJid: contact.canonicalJid,
+      phoneNumberJid: contact.phoneNumberJid,
+      lidJid: contact.lidJid,
+      phonebookName: contact.phonebookName,
+      whatsappPushName: contact.whatsappPushName,
+      verifiedName: contact.verifiedName,
+      username: contact.username,
+      pushName: contact.pushName,
+      nameSource: contact.nameSource as StoredContactIdentity['nameSource'],
+      isMyContact: contact.isMyContact,
+      profilePicUrl: contact.profilePicUrl,
+      lastSyncedAt: contact.lastSyncedAt,
+    };
+  }
+
+  private normalizeContacts(contacts: ExtendedBaileysContact[]): ContactIdentity[] {
+    return normalizeContactIdentities(contacts);
+  }
+
+  private findMatchingContacts(contacts: ContactModel[], identity: ContactIdentity): ContactModel[] {
+    const identityKeys = new Set(contactIdentityKeys(identity));
+    return contacts.filter((contact) =>
+      contactIdentityKeys(this.storedContactIdentity(contact)).some((key) => identityKeys.has(key)),
+    );
+  }
+
+  private selectContactCandidate(candidates: ContactModel[], identity: ContactIdentity): ContactModel | undefined {
+    return (
+      candidates.find((contact) => contact.remoteJid === identity.canonicalJid) ??
+      candidates.find((contact) => contact.phoneNumberJid === identity.phoneNumberJid) ??
+      candidates.find((contact) => contact.remoteJid === identity.remoteJid) ??
+      candidates[0]
+    );
+  }
+
+  private async persistContactIdentities(identities: ContactIdentity[]): Promise<ContactWebhookPayload[]> {
+    if (!identities.length) {
+      return [];
+    }
+
+    if (!this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+      return identities.map((identity) => this.contactWebhookPayload(identity));
+    }
+
+    const payloads: ContactWebhookPayload[] = [];
+    const batchSize = 100;
+
+    for (let offset = 0; offset < identities.length; offset += batchSize) {
+      const batch = identities.slice(offset, offset + batchSize);
+      const keys = [...new Set(batch.flatMap((identity) => contactIdentityKeys(identity)))];
+      const existingContacts = await this.prismaRepository.contact.findMany({
+        where: {
+          instanceId: this.instanceId,
+          OR: [
+            { remoteJid: { in: keys } },
+            { canonicalJid: { in: keys } },
+            { phoneNumberJid: { in: keys } },
+            { lidJid: { in: keys } },
+          ],
+        },
+      });
+      let activeContacts = [...existingContacts];
+
+      const operations: Prisma.PrismaPromise<unknown>[] = [];
+
+      for (const identity of batch) {
+        const candidates = this.findMatchingContacts(activeContacts, identity);
+        const existing = this.selectContactCandidate(candidates, identity);
+        const orderedCandidates = existing
+          ? [...candidates.filter((candidate) => candidate.id !== existing.id), existing]
+          : candidates;
+        const merged = orderedCandidates.reduce(
+          (current, candidate) => mergeContactIdentity(this.storedContactIdentity(candidate), current),
+          identity,
+        );
+        const data = {
+          remoteJid: merged.remoteJid,
+          canonicalJid: merged.canonicalJid,
+          phoneNumberJid: merged.phoneNumberJid,
+          lidJid: merged.lidJid,
+          pushName: merged.pushName,
+          phonebookName: merged.phonebookName,
+          whatsappPushName: merged.whatsappPushName,
+          verifiedName: merged.verifiedName,
+          username: merged.username,
+          nameSource: merged.nameSource,
+          isMyContact: merged.isMyContact,
+          profilePicUrl: merged.profilePicUrl,
+          lastSyncedAt: merged.lastSyncedAt,
+          instanceId: this.instanceId,
+        };
+
+        payloads.push(this.contactWebhookPayload(merged));
+
+        if (existing) {
+          operations.push(this.prismaRepository.contact.update({ where: { id: existing.id }, data }));
+          const duplicateIds = candidates.filter((contact) => contact.id !== existing.id).map((contact) => contact.id);
+
+          Object.assign(existing, data);
+
+          if (duplicateIds.length) {
+            operations.push(this.prismaRepository.contact.deleteMany({ where: { id: { in: duplicateIds } } }));
+            const duplicateIdSet = new Set(duplicateIds);
+            activeContacts = activeContacts.filter((contact) => !duplicateIdSet.has(contact.id));
+          }
+        } else {
+          operations.push(
+            this.prismaRepository.contact.upsert({
+              where: { remoteJid_instanceId: { remoteJid: data.remoteJid, instanceId: this.instanceId } },
+              create: data,
+              update: data,
+            }),
+          );
+        }
+      }
+
+      await this.prismaRepository.$transaction(operations);
+    }
+
+    return payloads;
+  }
+
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
-        const contactsRaw: any = contacts.map((contact) => ({
-          remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-          profilePicUrl: null,
-          instanceId: this.instanceId,
-        }));
+        const identities = this.normalizeContacts(contacts);
+        const contactsRaw = await this.persistContactIdentities(identities);
 
         if (contactsRaw.length > 0) {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
-
-          const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
+          const usersContacts = contactsRaw
+            .map((contact) => contact.phoneNumberJid ?? contact.remoteJid)
+            .filter((remoteJid) => remoteJid.includes('@s.whatsapp'));
+          if (usersContacts.length) {
+            await saveOnWhatsappCache(usersContacts.map((remoteJid) => ({ remoteJid })));
           }
         }
 
@@ -843,84 +987,28 @@ export class BaileysStartupService extends ChannelStartupService {
             this.localChatwoot,
           );
         }
-
-        const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
-            remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-            instanceId: this.instanceId,
-          })),
-        );
-
-        if (updatedContacts.length > 0) {
-          const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
-          }
-
-          this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
-          await Promise.all(
-            updatedContacts.map(async (contact) => {
-              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-                await this.prismaRepository.contact.updateMany({
-                  where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                  data: { profilePicUrl: contact.profilePicUrl },
-                });
-              }
-
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-                const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
-
-                const findParticipant = await this.chatwootService.findContact(
-                  instance,
-                  contact.remoteJid.split('@')[0],
-                );
-
-                if (!findParticipant) {
-                  return;
-                }
-
-                this.chatwootService.updateContact(instance, findParticipant.id, {
-                  name: contact.pushName,
-                  avatar_url: contact.profilePicUrl,
-                });
-              }
-            }),
-          );
-        }
       } catch (error) {
-        console.error(error);
-        this.logger.error(`Error: ${error.message}`);
+        this.logger.error(`Unable to upsert contacts: ${error.message}`);
       }
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
-      const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
-      for await (const contact of contacts) {
-        this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
-        contactsRaw.push({
-          remoteJid: contact.id,
-          pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-          instanceId: this.instanceId,
-        });
+      const contactsWithPictures = await Promise.all(
+        contacts.map(async (contact) => {
+          if (contact.imgUrl !== 'changed' || !contact.id) {
+            return contact;
+          }
+
+          const { profilePictureUrl } = await this.profilePicture(contact.id);
+          return { ...contact, imgUrl: profilePictureUrl };
+        }),
+      );
+      const identities = this.normalizeContacts(contactsWithPictures);
+      const contactsRaw = await this.persistContactIdentities(identities);
+
+      if (contactsRaw.length) {
+        this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
       }
-
-      this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
-
-      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-        const updateTransactions = contactsRaw.map((contact) =>
-          this.prismaRepository.contact.upsert({
-            where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-            create: contact,
-            update: contact,
-          }),
-        );
-        await this.prismaRepository.$transaction(updateTransactions);
-      }
-
-      //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
   };
 
@@ -1068,9 +1156,7 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
-        );
+        await this.contactHandle['contacts.upsert'](contacts.filter((contact) => !!contact.id));
 
         contacts = undefined;
         messages = undefined;
@@ -1490,23 +1576,46 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
+          const remoteJid = received.key.remoteJid;
+          if (!remoteJid || remoteJid === 'status@broadcast') {
+            continue;
+          }
+
+          const remoteJidAlt = received.key.remoteJidAlt;
+          const identities = this.normalizeContacts([
+            {
+              id: remoteJid,
+              lid: remoteJid.endsWith('@lid') ? remoteJid : remoteJidAlt?.endsWith('@lid') ? remoteJidAlt : undefined,
+              phoneNumber: remoteJid.endsWith('@s.whatsapp.net')
+                ? remoteJid
+                : remoteJidAlt?.endsWith('@s.whatsapp.net')
+                  ? remoteJidAlt
+                  : undefined,
+              notify: received.key.fromMe ? undefined : received.pushName,
+            },
+          ]);
+          const contactIdentity = identities[0];
+
+          if (!contactIdentity) {
+            continue;
+          }
+
+          const identityKeys = contactIdentityKeys(contactIdentity);
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: {
+              instanceId: this.instanceId,
+              OR: [
+                { remoteJid: { in: identityKeys } },
+                { canonicalJid: { in: identityKeys } },
+                { phoneNumberJid: { in: identityKeys } },
+                { lidJid: { in: identityKeys } },
+              ],
+            },
           });
+          const contactPayloads = await this.persistContactIdentities(identities);
+          const contactRaw = contactPayloads[0];
 
-          const contactRaw: {
-            remoteJid: string;
-            pushName: string;
-            profilePicUrl?: string;
-            instanceId: string;
-          } = {
-            remoteJid: received.key.remoteJid,
-            pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
-            instanceId: this.instanceId,
-          };
-
-          if (contactRaw.remoteJid === 'status@broadcast') {
+          if (!contactRaw) {
             continue;
           }
 
@@ -1532,24 +1641,10 @@ export class BaileysStartupService extends ChannelStartupService {
               );
             }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-              await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
-                update: contactRaw,
-              });
-
             continue;
           }
 
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
-
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: contactRaw,
-              create: contactRaw,
-            });
         }
       } catch (error) {
         this.logger.error(error);
@@ -3311,6 +3406,108 @@ export class BaileysStartupService extends ChannelStartupService {
     ['random', 'EVP'],
   ]);
 
+  private async finalizeRelayedMessage(messageSent: WAMessage) {
+    if (Long.isLong(messageSent?.messageTimestamp)) {
+      messageSent.messageTimestamp = messageSent.messageTimestamp.toNumber();
+    }
+
+    const messageRaw = this.prepareMessage(messageSent);
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.SEND_MESSAGE,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        messageRaw,
+      );
+    }
+
+    if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+      await this.prismaRepository.message.create({ data: messageRaw });
+    }
+
+    this.sendDataWebhook(Events.SEND_MESSAGE, messageRaw);
+
+    return messageRaw;
+  }
+
+  private async relayInteractiveMessage(number: string, message: proto.IMessage, options?: Options) {
+    const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
+    if (!isWA?.exists && !isJidGroup(isWA?.jid) && !isWA?.jid?.includes('@broadcast')) {
+      throw new BadRequestException(isWA);
+    }
+
+    const sender = isWA.jid.toLowerCase();
+
+    try {
+      if (options?.delay) {
+        this.logger.verbose(`Typing for ${options.delay}ms to ${sender}`);
+        await this.client.presenceSubscribe(sender);
+        await this.client.sendPresenceUpdate('composing', sender);
+        await delay(options.delay);
+        await this.client.sendPresenceUpdate('paused', sender);
+      }
+
+      let quoted: WAMessage;
+      if (options?.quoted) {
+        const candidate = options.quoted;
+        const quotedMessage = candidate?.message
+          ? candidate
+          : ((await this.getMessage(candidate.key, true)) as WAMessage);
+        if (quotedMessage) {
+          quoted = quotedMessage;
+        }
+      }
+
+      const messageId = generateMessageIDV2();
+      const generatedMessage = generateWAMessageFromContent(sender, message, {
+        timestamp: new Date(),
+        userJid: this.instance.wuid,
+        messageId,
+        quoted,
+      });
+
+      const bizNode = {
+        tag: 'biz',
+        attrs: {},
+        content: [
+          {
+            tag: 'interactive',
+            attrs: { type: 'native_flow', v: '1' },
+            content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' } }],
+          },
+        ],
+      };
+
+      const additionalNodes: any[] = [bizNode];
+      if (!isJidGroup(sender)) {
+        additionalNodes.unshift({ tag: 'bot', attrs: { biz_bot: '1' } });
+      }
+
+      const id = await this.client.relayMessage(sender, message, {
+        messageId,
+        additionalNodes,
+      });
+
+      generatedMessage.key = {
+        id,
+        remoteJid: sender,
+        participant: isPnUser(sender) ? sender : undefined,
+        fromMe: true,
+      };
+
+      for (const [key, value] of Object.entries(generatedMessage)) {
+        if (!value || (isArray(value) && value.length === 0)) {
+          delete generatedMessage[key];
+        }
+      }
+
+      return await this.finalizeRelayedMessage(generatedMessage);
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException(error);
+    }
+  }
+
   public async buttonMessage(data: SendButtonsDto) {
     if (data.buttons.length === 0) {
       throw new BadRequestException('At least one button is required');
@@ -3339,14 +3536,6 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new BadRequestException('PIX button cannot be mixed with other button types');
       }
     }
-
-    const isWA = (await this.whatsappNumber({ numbers: [data.number] }))?.shift();
-    if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
-      throw new BadRequestException(isWA);
-    }
-
-    const sender = isWA.jid.toLowerCase();
-    const isGroup = isJidGroup(sender);
 
     const generate = await (async () => {
       if (data?.thumbnailUrl) {
@@ -3389,83 +3578,7 @@ export class BaileysStartupService extends ChannelStartupService {
       interactiveMessage: interactiveMessage,
     };
 
-    try {
-      if (data?.delay) {
-        this.logger.verbose(`Typing for ${data.delay}ms to ${sender}`);
-        await this.client.presenceSubscribe(sender);
-        await this.client.sendPresenceUpdate('composing', sender);
-        await delay(data.delay);
-        await this.client.sendPresenceUpdate('paused', sender);
-      }
-
-      let quoted: WAMessage;
-      if (data?.quoted) {
-        const m = data?.quoted;
-        const msg = m?.message ? m : ((await this.getMessage(m.key, true)) as WAMessage);
-        if (msg) {
-          quoted = msg;
-        }
-      }
-
-      const messageId = generateMessageIDV2();
-      const m = generateWAMessageFromContent(sender, message, {
-        timestamp: new Date(),
-        userJid: this.instance.wuid,
-        messageId,
-        quoted,
-      });
-
-      const additionalNodes: any[] = [
-        {
-          tag: 'biz',
-          attrs: {},
-          content: [
-            {
-              tag: 'interactive',
-              attrs: { type: 'native_flow', v: '1' },
-              content: [
-                {
-                  tag: 'native_flow',
-                  attrs: { v: '2', name: 'mixed' },
-                  content: undefined,
-                },
-              ],
-            },
-          ],
-        },
-      ];
-
-      if (!isGroup) {
-        additionalNodes[0].content.push({
-          tag: 'bot',
-          attrs: { biz_bot: '1' },
-          content: undefined,
-        });
-      }
-
-      const id = await this.client.relayMessage(sender, message, {
-        messageId,
-        additionalNodes,
-      });
-
-      m.key = {
-        id: id,
-        remoteJid: sender,
-        participant: isPnUser(sender) ? sender : undefined,
-        fromMe: true,
-      };
-
-      for (const [key, value] of Object.entries(m)) {
-        if (!value || (isArray(value) && value.length) === 0) {
-          delete m[key];
-        }
-      }
-
-      return m;
-    } catch (error) {
-      this.logger.error(error);
-      throw new InternalServerErrorException(error);
-    }
+    return await this.relayInteractiveMessage(data.number, message, data);
   }
 
   public async locationMessage(data: SendLocationDto) {
@@ -3490,26 +3603,35 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async listMessage(data: SendListDto) {
-    return await this.sendMessageWithTyping(
-      data.number,
-      {
-        listMessage: {
-          title: data.title,
-          description: data.description,
-          buttonText: data?.buttonText,
-          footerText: data?.footerText,
-          sections: data.sections,
-          listType: 2,
+    const message: proto.IMessage = {
+      interactiveMessage: {
+        body: {
+          text: [data.title ? `*${data.title}*` : null, data.description].filter(Boolean).join('\n\n'),
+        },
+        footer: data.footerText ? { text: data.footerText } : undefined,
+        nativeFlowMessage: {
+          buttons: [
+            {
+              name: 'single_select',
+              buttonParamsJson: JSON.stringify({
+                title: data.buttonText || 'View options',
+                sections: data.sections.map((section) => ({
+                  title: section.title,
+                  rows: section.rows.map((row) => ({
+                    id: row.rowId,
+                    title: row.title,
+                    description: row.description,
+                  })),
+                })),
+              }),
+            },
+          ],
+          messageParamsJson: JSON.stringify({ from: 'api', templateId: v4() }),
         },
       },
-      {
-        delay: data?.delay,
-        presence: 'composing',
-        quoted: data?.quoted,
-        mentionsEveryOne: data?.mentionsEveryOne,
-        mentioned: data?.mentioned,
-      },
-    );
+    };
+
+    return await this.relayInteractiveMessage(data.number, message, data);
   }
 
   public async contactMessage(data: SendContactDto) {
@@ -4952,6 +5074,58 @@ export class BaileysStartupService extends ChannelStartupService {
     const response = { me: this.client.authState.creds.me, account: this.client.authState.creds.account };
 
     return response;
+  }
+
+  public async baileysResyncContacts(forceFull = false) {
+    if (this.contactResyncPromise) {
+      return await this.contactResyncPromise;
+    }
+
+    this.contactResyncPromise = (async () => {
+      const collection = 'critical_unblock_low' as const;
+      const keys = this.client.authState.keys;
+      const previousState = (await keys.get('app-state-sync-version', [collection]))[collection];
+
+      try {
+        if (forceFull) {
+          await keys.set({ 'app-state-sync-version': { [collection]: null } });
+        }
+
+        await this.client.resyncAppState([collection], false);
+        const syncedState = (await keys.get('app-state-sync-version', [collection]))[collection];
+
+        if (!syncedState) {
+          if (previousState) {
+            await keys.set({ 'app-state-sync-version': { [collection]: previousState } });
+          }
+
+          throw new BadRequestException('contact_resync_requires_repairing');
+        }
+
+        return {
+          status: 'completed' as const,
+          collection,
+          forceFull,
+          requestedAt: new Date().toISOString(),
+        };
+      } catch (error) {
+        const currentState = forceFull
+          ? (await keys.get('app-state-sync-version', [collection]))[collection]
+          : undefined;
+
+        if (forceFull && previousState && !currentState) {
+          await keys.set({ 'app-state-sync-version': { [collection]: previousState } });
+        }
+
+        throw error;
+      }
+    })();
+
+    try {
+      return await this.contactResyncPromise;
+    } finally {
+      this.contactResyncPromise = undefined;
+    }
   }
 
   //Business Controller

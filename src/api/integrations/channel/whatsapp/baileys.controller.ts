@@ -57,4 +57,10 @@ export class BaileysController {
 
     return instance.baileysGetAuthState();
   }
+
+  public async resyncContacts({ instanceName }: InstanceDto, body: { forceFull?: boolean }) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
+    return instance.baileysResyncContacts(body?.forceFull === true);
+  }
 }

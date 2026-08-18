@@ -138,18 +138,31 @@ model Chat {
 }
 
 model Contact {
-  id            String    @id @default(cuid())
-  remoteJid     String    @db.VarChar(100)
-  pushName      String?   @db.VarChar(100)
-  profilePicUrl String?   @db.VarChar(500)
-  createdAt     DateTime? @default(now()) @db.Timestamp
-  updatedAt     DateTime? @updatedAt @db.Timestamp
-  Instance      Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
-  instanceId    String
+  id               String    @id @default(cuid())
+  remoteJid        String    @db.VarChar(100)
+  canonicalJid     String?   @db.VarChar(100)
+  phoneNumberJid   String?   @db.VarChar(100)
+  lidJid           String?   @db.VarChar(100)
+  pushName         String?   @db.VarChar(255)
+  phonebookName    String?   @db.VarChar(255)
+  whatsappPushName String?   @db.VarChar(255)
+  verifiedName     String?   @db.VarChar(255)
+  username         String?   @db.VarChar(100)
+  nameSource       String?   @db.VarChar(32)
+  isMyContact      Boolean?  @db.Boolean
+  profilePicUrl    String?   @db.VarChar(500)
+  lastSyncedAt     DateTime? @db.Timestamp
+  createdAt        DateTime? @default(now()) @db.Timestamp
+  updatedAt        DateTime? @updatedAt @db.Timestamp
+  Instance         Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId       String
 
   @@unique([remoteJid, instanceId])
   @@index([remoteJid])
   @@index([instanceId])
+  @@index([instanceId, canonicalJid])
+  @@index([instanceId, phoneNumberJid])
+  @@index([instanceId, lidJid])
 }
 
 model Message {

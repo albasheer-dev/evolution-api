@@ -501,18 +501,33 @@ export class ChannelStartupService {
     const where: any = {
       instanceId: this.instanceId,
     };
+    const contactWhere = query?.where as Record<string, unknown> | undefined;
 
-    if (query?.where?.remoteJid) {
-      const remoteJid = query.where.remoteJid.includes('@') ? query.where.remoteJid : createJid(query.where.remoteJid);
-      where['remoteJid'] = remoteJid;
+    if (contactWhere?.remoteJid && typeof contactWhere.remoteJid === 'string') {
+      const remoteJid = contactWhere.remoteJid.includes('@')
+        ? contactWhere.remoteJid
+        : createJid(contactWhere.remoteJid);
+      where['OR'] = [{ remoteJid }, { canonicalJid: remoteJid }, { phoneNumberJid: remoteJid }, { lidJid: remoteJid }];
     }
 
-    if (query?.where?.id) {
-      where['id'] = query.where.id;
+    if (contactWhere?.id) {
+      where['id'] = contactWhere.id;
     }
 
-    if (query?.where?.pushName) {
-      where['pushName'] = query.where.pushName;
+    for (const field of [
+      'pushName',
+      'phonebookName',
+      'whatsappPushName',
+      'verifiedName',
+      'username',
+      'canonicalJid',
+      'phoneNumberJid',
+      'lidJid',
+      'isMyContact',
+    ]) {
+      if (contactWhere?.[field] !== undefined) {
+        where[field] = contactWhere[field];
+      }
     }
 
     const contactFindManyArgs: Prisma.ContactFindManyArgs = {
@@ -530,12 +545,22 @@ export class ChannelStartupService {
     return contacts.map((contact) => {
       const remoteJid = contact.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
-      const isSaved = !!contact.pushName || !!contact.profilePicUrl;
+      const displayName =
+        [
+          contact.phonebookName,
+          contact.verifiedName,
+          contact.whatsappPushName,
+          contact.username,
+          contact.pushName,
+        ].find((value) => value?.trim()) ?? remoteJid.split('@')[0];
+      const isSaved = contact.isMyContact === true;
       const type = isGroup ? 'group' : isSaved ? 'contact' : 'group_member';
       return {
         ...contact,
+        displayName,
         isGroup,
         isSaved,
+        savedContactStatus: isSaved ? 'saved' : 'unknown',
         type,
       };
     });
