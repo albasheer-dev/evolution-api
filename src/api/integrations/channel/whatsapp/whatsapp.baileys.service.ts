@@ -162,6 +162,7 @@ import {
   normalizeContactIdentities,
   StoredContactIdentity,
 } from './contact-identity';
+import { buildMessageTimestampFilter, MessageTimestampQuery } from './message-timestamp-filter';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -5245,16 +5246,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async fetchMessages(query: Query<Message>) {
     const keyFilters = query?.where?.key as ExtendedIMessageKey;
-
-    const timestampFilter = {};
-    if (query?.where?.messageTimestamp) {
-      if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
-        timestampFilter['messageTimestamp'] = {
-          gte: Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
-          lte: Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
-        };
-      }
-    }
+    const timestampFilter = buildMessageTimestampFilter(
+      query?.where?.messageTimestamp as MessageTimestampQuery | undefined,
+    );
 
     const count = await this.prismaRepository.message.count({
       where: {
