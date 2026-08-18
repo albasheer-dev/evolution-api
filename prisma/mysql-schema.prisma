@@ -134,6 +134,7 @@ model Chat {
 
   @@unique([instanceId, remoteJid])
   @@index([instanceId])
+  @@index([instanceId, updatedAt])
   @@index([remoteJid])
 }
 
@@ -160,6 +161,7 @@ model Contact {
   @@unique([remoteJid, instanceId])
   @@index([remoteJid])
   @@index([instanceId])
+  @@index([instanceId, updatedAt])
   @@index([instanceId, canonicalJid])
   @@index([instanceId, phoneNumberJid])
   @@index([instanceId, lidJid])
@@ -192,6 +194,7 @@ model Message {
   session   IntegrationSession? @relation(fields: [sessionId], references: [id])
 
   @@index([instanceId])
+  @@index([instanceId, messageTimestamp])
 }
 
 model MessageUpdate {

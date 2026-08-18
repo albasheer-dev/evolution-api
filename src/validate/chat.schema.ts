@@ -189,6 +189,12 @@ export const contactValidateSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
   properties: {
+    take: { type: 'integer', minimum: 1, maximum: 1000 },
+    skip: { type: 'integer', minimum: 0 },
+    offset: { type: 'integer', minimum: 1, maximum: 1000 },
+    page: { type: 'integer', minimum: 1 },
+    updatedAfter: { type: 'string', format: 'date-time' },
+    orderBy: { type: 'object', additionalProperties: { type: 'string', enum: ['asc', 'desc'] } },
     where: {
       type: 'object',
       properties: {
@@ -226,6 +232,11 @@ export const messageValidateSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
   properties: {
+    take: { type: 'integer', minimum: 1, maximum: 1000 },
+    skip: { type: 'integer', minimum: 0 },
+    offset: { type: 'integer', minimum: 1, maximum: 1000 },
+    page: { type: 'integer', minimum: 1 },
+    orderBy: { type: 'object', additionalProperties: { type: 'string', enum: ['asc', 'desc'] } },
     where: {
       type: 'object',
       properties: {
@@ -254,6 +265,13 @@ export const messageValidateSchema: JSONSchema7 = {
           },
         },
         message: { type: 'object' },
+        messageTimestamp: {
+          type: 'object',
+          properties: {
+            gte: { type: 'string', format: 'date-time' },
+            lte: { type: 'string', format: 'date-time' },
+          },
+        },
       },
       ...isNotEmpty('_id'),
     },

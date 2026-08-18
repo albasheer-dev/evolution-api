@@ -7,6 +7,10 @@ export class Query<T> {
   sort?: 'asc' | 'desc';
   page?: number;
   offset?: number;
+  take?: number;
+  skip?: number;
+  updatedAfter?: string;
+  orderBy?: Record<string, 'asc' | 'desc'>;
 }
 
 export class PrismaRepository extends PrismaClient {

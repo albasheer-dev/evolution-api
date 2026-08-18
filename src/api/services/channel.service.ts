@@ -530,12 +530,27 @@ export class ChannelStartupService {
       }
     }
 
+    if (query.updatedAfter) {
+      const updatedAfter = new Date(query.updatedAfter);
+
+      if (!Number.isNaN(updatedAfter.getTime())) {
+        where.updatedAt = { gt: updatedAfter };
+      }
+    }
+
     const contactFindManyArgs: Prisma.ContactFindManyArgs = {
       where,
+      orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
     };
 
-    if (query.offset) contactFindManyArgs.take = query.offset;
-    if (query.page) {
+    if (query.take) {
+      contactFindManyArgs.take = Math.max(1, query.take);
+      contactFindManyArgs.skip = Math.max(0, query.skip ?? 0);
+    } else if (query.offset) {
+      contactFindManyArgs.take = query.offset;
+    }
+
+    if (!query.take && query.page && query.offset) {
       const validPage = Math.max(query.page as number, 1);
       contactFindManyArgs.skip = query.offset * (validPage - 1);
     }
@@ -632,11 +647,20 @@ export class ChannelStartupService {
 
     const timestampFilter = {};
     if (query?.where?.messageTimestamp) {
-      if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
-        timestampFilter['messageTimestamp'] = {
-          gte: Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
-          lte: Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
-        };
+      const gte = query.where.messageTimestamp['gte'];
+      const lte = query.where.messageTimestamp['lte'];
+      const range = {};
+
+      if (gte && !Number.isNaN(new Date(gte).getTime())) {
+        range['gte'] = Math.floor(new Date(gte).getTime() / 1000);
+      }
+
+      if (lte && !Number.isNaN(new Date(lte).getTime())) {
+        range['lte'] = Math.floor(new Date(lte).getTime() / 1000);
+      }
+
+      if (Object.keys(range).length > 0) {
+        timestampFilter['messageTimestamp'] = range;
       }
     }
 
@@ -656,13 +680,8 @@ export class ChannelStartupService {
       },
     });
 
-    if (!query?.offset) {
-      query.offset = 50;
-    }
-
-    if (!query?.page) {
-      query.page = 1;
-    }
+    const take = Math.max(1, query.take ?? query.offset ?? 50);
+    const skip = Math.max(0, query.skip ?? take * (Math.max(query.page ?? 1, 1) - 1));
 
     const messages = await this.prismaRepository.message.findMany({
       where: {
@@ -681,8 +700,8 @@ export class ChannelStartupService {
       orderBy: {
         messageTimestamp: 'desc',
       },
-      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
-      take: query.offset,
+      skip,
+      take,
       select: {
         id: true,
         key: true,
@@ -704,8 +723,8 @@ export class ChannelStartupService {
     return {
       messages: {
         total: count,
-        pages: Math.ceil(count / query.offset),
-        currentPage: query.page,
+        pages: Math.ceil(count / take),
+        currentPage: Math.floor(skip / take) + 1,
         records: messages,
       },
     };
@@ -765,6 +784,15 @@ export class ChannelStartupService {
 
     const limit = query?.take ? Prisma.sql`LIMIT ${query.take}` : Prisma.sql``;
     const offset = query?.skip ? Prisma.sql`OFFSET ${query.skip}` : Prisma.sql``;
+    const updatedAfter = query?.updatedAfter ? new Date(query.updatedAfter) : null;
+    const incrementalDirectoryFilter =
+      updatedAfter && !Number.isNaN(updatedAfter.getTime())
+        ? Prisma.sql`AND (
+          "Message"."messageTimestamp" > ${Math.floor(updatedAfter.getTime() / 1000)}
+          OR "Chat"."updatedAt" > ${updatedAfter}
+          OR "Contact"."updatedAt" > ${updatedAfter}
+        )`
+        : Prisma.sql``;
 
     const results = await this.prismaRepository.$queryRaw`
       WITH rankedMessages AS (
@@ -776,8 +804,9 @@ export class ChannelStartupService {
             ELSE COALESCE("Contact"."pushName", "Message"."pushName")
           END as "pushName",
           "Contact"."profilePicUrl",
-          COALESCE(
-            to_timestamp("Message"."messageTimestamp"::double precision), 
+          GREATEST(
+            to_timestamp("Message"."messageTimestamp"::double precision),
+            "Chat"."updatedAt",
             "Contact"."updatedAt"
           ) as "updatedAt",
           "Chat"."name" as "pushName",
@@ -806,10 +835,11 @@ export class ChannelStartupService {
         WHERE "Message"."instanceId" = ${this.instanceId}
         ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
         ${timestampFilter}
+        ${incrementalDirectoryFilter}
         ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
       )
-      SELECT * FROM rankedMessages 
-      ORDER BY "updatedAt" DESC NULLS LAST
+      SELECT * FROM rankedMessages
+      ORDER BY "updatedAt" ASC NULLS LAST, "remoteJid" ASC
       ${limit}
       ${offset};
     `;
