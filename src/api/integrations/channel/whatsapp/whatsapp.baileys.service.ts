@@ -545,6 +545,8 @@ export class BaileysStartupService extends ChannelStartupService {
         profilePictureUrl: this.instance.profilePictureUrl,
         ...this.stateConnection,
       });
+
+      await this.reconcileStoredContactLidMappings();
     }
 
     if (connection === 'connecting') {
@@ -924,6 +926,54 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return applyLidPhoneMappings(contacts, mappings);
+  }
+
+  private async reconcileStoredContactLidMappings(): Promise<void> {
+    if (!this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+      return;
+    }
+
+    try {
+      const unresolvedContacts = await this.prismaRepository.contact.findMany({
+        where: {
+          instanceId: this.instanceId,
+          phoneNumberJid: null,
+          OR: [
+            { lidJid: { not: null } },
+            { remoteJid: { endsWith: '@lid' } },
+            { remoteJid: { endsWith: '@hosted.lid' } },
+          ],
+        },
+      });
+
+      if (!unresolvedContacts.length) {
+        return;
+      }
+
+      const enrichedContacts = await this.enrichContactsWithLidMappings(
+        unresolvedContacts.map((contact) => ({
+          id: contact.remoteJid,
+          lid: contact.lidJid ?? contact.remoteJid,
+          phoneNumber: contact.phoneNumberJid ?? undefined,
+          name: contact.phonebookName ?? undefined,
+          notify: contact.whatsappPushName ?? undefined,
+          verifiedName: contact.verifiedName ?? undefined,
+          username: contact.username ?? undefined,
+          imgUrl: contact.profilePicUrl ?? undefined,
+        })),
+      );
+      const resolvedIdentities = this.normalizeContacts(enrichedContacts).filter(
+        (identity) => !!identity.phoneNumberJid,
+      );
+      const payloads = await this.persistContactIdentities(resolvedIdentities);
+
+      if (payloads.length) {
+        this.sendDataWebhook(Events.CONTACTS_UPDATE, payloads);
+        this.logger.info(`Reconciled ${payloads.length} stored LID contact identities`);
+      }
+    } catch (error) {
+      this.logger.warn(`Unable to reconcile stored LID contacts: ${error?.message ?? error}`);
+    }
   }
 
   private findMatchingContacts(contacts: ContactModel[], identity: ContactIdentity): ContactModel[] {
