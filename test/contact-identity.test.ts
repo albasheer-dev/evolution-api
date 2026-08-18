@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  applyLidPhoneMappings,
+  extractLidPhoneMappings,
+  lidPhoneMapping,
   mergeContactIdentity,
   normalizeContactIdentities,
   normalizeContactIdentity,
@@ -93,5 +96,66 @@ describe('contact identity normalization', () => {
     assert.equal(identities[0].phonebookName, 'Saved name');
     assert.equal(identities[0].whatsappPushName, 'WhatsApp profile');
     assert.equal(identities[0].pushName, 'Saved name');
+  });
+
+  it('extracts LID mappings from direct and group message addresses', () => {
+    const mappings = extractLidPhoneMappings([
+      {
+        key: {
+          remoteJid: '123456789:3@lid',
+          remoteJidAlt: '966500000006:3@s.whatsapp.net',
+        },
+      },
+      {
+        key: {
+          remoteJid: '120363000000000000@g.us',
+          participant: '987654321@lid',
+          participantAlt: '966500000007@s.whatsapp.net',
+        },
+      },
+    ]);
+
+    assert.deepEqual(mappings, [
+      {
+        lidJid: '123456789@lid',
+        phoneNumberJid: '966500000006@s.whatsapp.net',
+      },
+      {
+        lidJid: '987654321@lid',
+        phoneNumberJid: '966500000007@s.whatsapp.net',
+      },
+    ]);
+  });
+
+  it('adds a known phone-number identity to a LID-only contact', () => {
+    const contacts = applyLidPhoneMappings(
+      [{ id: '123456789@lid', name: 'Saved name' }],
+      [{ lidJid: '123456789@lid', phoneNumberJid: '966500000008@s.whatsapp.net' }],
+    );
+    const identity = normalizeContactIdentity(contacts[0]);
+
+    assert.ok(identity);
+    assert.equal(identity.phoneNumberJid, '966500000008@s.whatsapp.net');
+    assert.equal(identity.lidJid, '123456789@lid');
+    assert.equal(identity.canonicalJid, '966500000008@s.whatsapp.net');
+  });
+
+  it('keeps the explicit mapping when a phone-number contact includes its LID', () => {
+    const contacts = applyLidPhoneMappings(
+      [{ id: '966500000010@s.whatsapp.net', lid: '123456780@lid', name: 'Saved name' }],
+      [],
+    );
+    const identity = normalizeContactIdentity(contacts[0]);
+
+    assert.ok(identity);
+    assert.equal(identity.phoneNumberJid, '966500000010@s.whatsapp.net');
+    assert.equal(identity.lidJid, '123456780@lid');
+  });
+
+  it('normalizes device-specific LID and phone-number mappings', () => {
+    assert.deepEqual(lidPhoneMapping('123456789:24@lid', '966500000009:24@s.whatsapp.net'), {
+      lidJid: '123456789@lid',
+      phoneNumberJid: '966500000009@s.whatsapp.net',
+    });
   });
 });

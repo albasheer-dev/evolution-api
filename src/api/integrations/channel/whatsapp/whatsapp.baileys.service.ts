@@ -155,9 +155,13 @@ import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import {
+  applyLidPhoneMappings,
   ContactIdentity,
   contactIdentityKeys,
   ExtendedBaileysContact,
+  extractLidPhoneMappings,
+  LidPhoneMapping,
+  lidPhoneMapping,
   mergeContactIdentity,
   normalizeContactIdentities,
   StoredContactIdentity,
@@ -853,6 +857,75 @@ export class BaileysStartupService extends ChannelStartupService {
     return normalizeContactIdentities(contacts);
   }
 
+  private async rememberLidPhoneMappings(mappings: LidPhoneMapping[]): Promise<void> {
+    if (!mappings.length) {
+      return;
+    }
+
+    const uniqueMappings = [...new Map(mappings.map((mapping) => [mapping.lidJid, mapping])).values()];
+
+    try {
+      await this.client.signalRepository.lidMapping.storeLIDPNMappings(
+        uniqueMappings.map((mapping) => ({
+          lid: mapping.lidJid,
+          pn: mapping.phoneNumberJid,
+        })),
+      );
+    } catch (error) {
+      this.logger.warn(`Unable to store LID mappings: ${error?.message ?? error}`);
+    }
+  }
+
+  private async enrichContactsWithLidMappings(contacts: ExtendedBaileysContact[]): Promise<ExtendedBaileysContact[]> {
+    if (!contacts.length) {
+      return contacts;
+    }
+
+    const mappings: LidPhoneMapping[] = [];
+    const unresolvedLids = new Set<string>();
+
+    for (const contact of contacts) {
+      const mapping = lidPhoneMapping(contact.lid ?? contact.id, contact.phoneNumber ?? contact.id);
+
+      if (mapping) {
+        mappings.push(mapping);
+        continue;
+      }
+
+      const lid =
+        contact.lid ?? (contact.id?.endsWith('@lid') || contact.id?.endsWith('@hosted.lid') ? contact.id : undefined);
+
+      if (lid) {
+        unresolvedLids.add(jidNormalizedUser(lid));
+      }
+    }
+
+    await this.rememberLidPhoneMappings(mappings);
+
+    const lids = [...unresolvedLids];
+    const lookupBatchSize = 50;
+
+    for (let offset = 0; offset < lids.length; offset += lookupBatchSize) {
+      const resolved = await Promise.all(
+        lids.slice(offset, offset + lookupBatchSize).map(async (lid): Promise<LidPhoneMapping | null> => {
+          try {
+            const phoneNumber = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+
+            return lidPhoneMapping(lid, phoneNumber);
+          } catch (error) {
+            this.logger.debug(`Unable to resolve LID ${lid}: ${error?.message ?? error}`);
+
+            return null;
+          }
+        }),
+      );
+
+      mappings.push(...resolved.filter((mapping): mapping is LidPhoneMapping => mapping !== null));
+    }
+
+    return applyLidPhoneMappings(contacts, mappings);
+  }
+
   private findMatchingContacts(contacts: ContactModel[], identity: ContactIdentity): ContactModel[] {
     const identityKeys = new Set(contactIdentityKeys(identity));
     return contacts.filter((contact) =>
@@ -959,7 +1032,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
-        const identities = this.normalizeContacts(contacts);
+        const enrichedContacts = await this.enrichContactsWithLidMappings(contacts);
+        const identities = this.normalizeContacts(enrichedContacts);
         const contactsRaw = await this.persistContactIdentities(identities);
 
         if (contactsRaw.length > 0) {
@@ -1004,7 +1078,8 @@ export class BaileysStartupService extends ChannelStartupService {
           return { ...contact, imgUrl: profilePictureUrl };
         }),
       );
-      const identities = this.normalizeContacts(contactsWithPictures);
+      const enrichedContacts = await this.enrichContactsWithLidMappings(contactsWithPictures);
+      const identities = this.normalizeContacts(enrichedContacts);
       const contactsRaw = await this.persistContactIdentities(identities);
 
       if (contactsRaw.length) {
@@ -1036,6 +1111,8 @@ export class BaileysStartupService extends ChannelStartupService {
         console.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
+
+        await this.rememberLidPhoneMappings(extractLidPhoneMappings(messages));
 
         const instance: InstanceDto = { instanceName: this.instance.name };
 
@@ -2141,14 +2218,33 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async profilePicture(number: string) {
     const jid = createJid(number);
+    const candidates = [jid];
 
-    try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
+    if (jid.endsWith('@lid') || jid.endsWith('@hosted.lid')) {
+      try {
+        const phoneNumberJid = await this.client.signalRepository.lidMapping.getPNForLID(jid);
 
-      return { wuid: jid, profilePictureUrl };
-    } catch {
-      return { wuid: jid, profilePictureUrl: null };
+        if (phoneNumberJid) {
+          candidates.unshift(jidNormalizedUser(phoneNumberJid));
+        }
+      } catch (error) {
+        this.logger.debug(`Unable to resolve profile picture LID ${jid}: ${error?.message ?? error}`);
+      }
     }
+
+    for (const candidate of [...new Set(candidates)]) {
+      try {
+        const profilePictureUrl = await this.client.profilePictureUrl(candidate, 'image');
+
+        if (profilePictureUrl) {
+          return { wuid: candidate, profilePictureUrl };
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return { wuid: jid, profilePictureUrl: null };
   }
 
   public async getStatus(number: string) {

@@ -15,6 +15,20 @@ export type ExtendedBaileysContact = Partial<Contact> & {
   username?: string;
 };
 
+export type LidPhoneMapping = {
+  lidJid: string;
+  phoneNumberJid: string;
+};
+
+export type MessageIdentityEnvelope = {
+  key?: {
+    remoteJid?: string | null;
+    remoteJidAlt?: string | null;
+    participant?: string | null;
+    participantAlt?: string | null;
+  } | null;
+};
+
 export type ContactIdentity = {
   remoteJid: string;
   canonicalJid: string;
@@ -36,7 +50,7 @@ export type StoredContactIdentity = Partial<Omit<ContactIdentity, 'lastSyncedAt'
   lastSyncedAt?: Date | null;
 };
 
-const PERSON_JID_SUFFIXES = ['@s.whatsapp.net', '@c.us', '@lid'];
+const PERSON_JID_SUFFIXES = ['@s.whatsapp.net', '@c.us', '@lid', '@hosted', '@hosted.lid'];
 
 function cleanValue(value?: string | null, maxLength = 255): string | undefined {
   const cleaned = value?.trim();
@@ -45,17 +59,92 @@ function cleanValue(value?: string | null, maxLength = 255): string | undefined 
 }
 
 function normalizeJid(value?: string | null): string | undefined {
-  const jid = cleanValue(value, 100)?.toLowerCase();
+  let jid = cleanValue(value, 100)?.toLowerCase();
 
   if (!jid) {
     return undefined;
   }
 
   if (jid.endsWith('@c.us')) {
-    return `${jid.slice(0, -5)}@s.whatsapp.net`;
+    jid = `${jid.slice(0, -5)}@s.whatsapp.net`;
+  }
+
+  const separator = jid.lastIndexOf('@');
+
+  if (separator > 0 && PERSON_JID_SUFFIXES.some((suffix) => jid.endsWith(suffix))) {
+    const user = jid.slice(0, separator).replace(/:\d+$/, '');
+    const server = jid.slice(separator + 1);
+
+    return `${user}@${server}`;
   }
 
   return jid;
+}
+
+function isLidJid(jid?: string): boolean {
+  return !!jid && (jid.endsWith('@lid') || jid.endsWith('@hosted.lid'));
+}
+
+function isPhoneNumberJid(jid?: string): boolean {
+  return !!jid && (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@hosted'));
+}
+
+export function lidPhoneMapping(first?: string | null, second?: string | null): LidPhoneMapping | null {
+  const normalizedFirst = normalizeJid(first);
+  const normalizedSecond = normalizeJid(second);
+
+  if (isLidJid(normalizedFirst) && isPhoneNumberJid(normalizedSecond)) {
+    return { lidJid: normalizedFirst, phoneNumberJid: normalizedSecond };
+  }
+
+  if (isLidJid(normalizedSecond) && isPhoneNumberJid(normalizedFirst)) {
+    return { lidJid: normalizedSecond, phoneNumberJid: normalizedFirst };
+  }
+
+  return null;
+}
+
+export function extractLidPhoneMappings(messages: MessageIdentityEnvelope[]): LidPhoneMapping[] {
+  const mappings = new Map<string, LidPhoneMapping>();
+
+  for (const message of messages) {
+    const pairs = [
+      lidPhoneMapping(message.key?.remoteJid, message.key?.remoteJidAlt),
+      lidPhoneMapping(message.key?.participant, message.key?.participantAlt),
+    ];
+
+    for (const mapping of pairs) {
+      if (mapping) {
+        mappings.set(mapping.lidJid, mapping);
+      }
+    }
+  }
+
+  return [...mappings.values()];
+}
+
+export function applyLidPhoneMappings(
+  contacts: ExtendedBaileysContact[],
+  mappings: LidPhoneMapping[],
+): ExtendedBaileysContact[] {
+  const phoneByLid = new Map(mappings.map((mapping) => [mapping.lidJid, mapping.phoneNumberJid]));
+
+  return contacts.map((contact) => {
+    const remoteJid = normalizeJid(contact.id);
+    const lidJid = normalizeJid(contact.lid ?? (isLidJid(remoteJid) ? remoteJid : undefined));
+    const explicitMapping = lidPhoneMapping(lidJid, contact.phoneNumber ?? remoteJid);
+    const phoneNumberJid = explicitMapping?.phoneNumberJid ?? (lidJid ? phoneByLid.get(lidJid) : undefined);
+
+    if (!lidJid || !phoneNumberJid) {
+      return contact;
+    }
+
+    return {
+      ...contact,
+      lid: lidJid,
+      phoneNumber: phoneNumberJid,
+    };
+  });
 }
 
 function isPersonJid(jid?: string): boolean {
