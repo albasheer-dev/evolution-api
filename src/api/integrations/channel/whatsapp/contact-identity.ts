@@ -285,6 +285,20 @@ export function normalizeContactIdentities(
   return [...identities.values()];
 }
 
+export function isPublishableContactIdentity(identity: StoredContactIdentity): boolean {
+  const hasResolvedPhone = isPhoneNumberJid(identity.phoneNumberJid) || isPhoneNumberJid(identity.canonicalJid);
+  const hasUsefulMetadata = [
+    identity.phonebookName,
+    identity.whatsappPushName,
+    identity.verifiedName,
+    identity.username,
+    identity.profilePicUrl,
+  ].some((value) => !!value?.trim());
+  const isUnresolvedLid = isLidJid(identity.lidJid) || isLidJid(identity.remoteJid);
+
+  return hasResolvedPhone || !isUnresolvedLid || hasUsefulMetadata;
+}
+
 export function mergeContactIdentity(
   existing: StoredContactIdentity | undefined,
   incoming: ContactIdentity,

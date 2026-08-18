@@ -503,6 +503,22 @@ export class ChannelStartupService {
     };
     const contactWhere = query?.where as Record<string, unknown> | undefined;
 
+    if (!contactWhere?.remoteJid && !contactWhere?.id) {
+      where['NOT'] = {
+        AND: [
+          {
+            OR: [{ remoteJid: { endsWith: '@lid' } }, { remoteJid: { endsWith: '@hosted.lid' } }],
+          },
+          { phoneNumberJid: null },
+          { phonebookName: null },
+          { whatsappPushName: null },
+          { verifiedName: null },
+          { username: null },
+          { profilePicUrl: null },
+        ],
+      };
+    }
+
     if (contactWhere?.remoteJid && typeof contactWhere.remoteJid === 'string') {
       const remoteJid = contactWhere.remoteJid.includes('@')
         ? contactWhere.remoteJid

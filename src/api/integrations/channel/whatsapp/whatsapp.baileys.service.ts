@@ -160,6 +160,7 @@ import {
   contactIdentityKeys,
   ExtendedBaileysContact,
   extractLidPhoneMappings,
+  isPublishableContactIdentity,
   LidPhoneMapping,
   lidPhoneMapping,
   mergeContactIdentity,
@@ -1049,7 +1050,9 @@ export class BaileysStartupService extends ChannelStartupService {
           instanceId: this.instanceId,
         };
 
-        payloads.push(this.contactWebhookPayload(merged));
+        if (isPublishableContactIdentity(merged)) {
+          payloads.push(this.contactWebhookPayload(merged));
+        }
 
         if (existing) {
           operations.push(this.prismaRepository.contact.update({ where: { id: existing.id }, data }));

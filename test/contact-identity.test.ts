@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   applyLidPhoneMappings,
   extractLidPhoneMappings,
+  isPublishableContactIdentity,
   lidPhoneMapping,
   mergeContactIdentity,
   normalizeContactIdentities,
@@ -157,5 +158,21 @@ describe('contact identity normalization', () => {
       lidJid: '123456789@lid',
       phoneNumberJid: '966500000009@s.whatsapp.net',
     });
+  });
+
+  it('keeps unresolved empty LIDs internal until useful identity data arrives', () => {
+    const unresolved = normalizeContactIdentity({ id: '123456789@lid' });
+    const named = normalizeContactIdentity({ id: '123456789@lid', name: 'Saved name' });
+    const resolved = normalizeContactIdentity({
+      id: '123456789@lid',
+      phoneNumber: '966500000011@s.whatsapp.net',
+    });
+
+    assert.ok(unresolved);
+    assert.ok(named);
+    assert.ok(resolved);
+    assert.equal(isPublishableContactIdentity(unresolved), false);
+    assert.equal(isPublishableContactIdentity(named), true);
+    assert.equal(isPublishableContactIdentity(resolved), true);
   });
 });
