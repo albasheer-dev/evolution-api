@@ -273,6 +273,15 @@ describe('ExampleService', () => {
 
 ## Commit & Pull Request Guidelines
 
+### Application Fork Workflow
+
+- `app` is the permanent integration branch for the application fork.
+- Start every feature or fix branch from the latest `app` branch.
+- Open pull requests against `app`, not `main` or `develop`.
+- Do not commit product changes directly to `app`; merge them through pull requests.
+- Create application release tags only from an up-to-date `app` commit.
+- Keep fork commit subjects short and natural, as a developer would write them, without decorative punctuation or generated summaries.
+
 ### Conventional Commits (Enforced by commitlint)
 ```bash
 # Use interactive commit tool
@@ -352,4 +361,3 @@ export DATABASE_PROVIDER=postgresql  # or mysql
 - **Error tracking**: Comprehensive error scenarios
 - **Health checks**: Instance status and connection monitoring
 - **Telemetry**: Usage analytics (non-sensitive data only)
-
